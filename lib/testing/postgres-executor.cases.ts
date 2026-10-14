@@ -1,7 +1,7 @@
 import type { SqlIsolationLevel, SqlTransaction } from '../interfaces/sql-executor.interface.js';
 import { columns, toBool, toInt, toJson, toText } from '../postgres/sql/columns.js';
 import { SqlParams } from '../postgres/sql/sql-params.js';
-import { equal, isTypeError, jitter, messages, rejection } from './assertions.js';
+import { equal, isTypeError, jitter, messages, rejection, setsNative } from './assertions.js';
 import type { DialectCases } from './sql-executor.contract.js';
 
 const ISOLATION_LEVELS: SqlIsolationLevel[] = ['read uncommitted', 'read committed', 'repeatable read', 'serializable'];
@@ -157,6 +157,42 @@ export const POSTGRES_CASES: DialectCases = {
         }
         isTypeError(thrown, `wrapTransaction() of ${label}`);
       }
+    },
+
+    async native(target, table) {
+      if (!(await setsNative(target))) {
+        return;
+      }
+
+      // Nothing reads from outside while the work runs: on one connection, that read would wait for the transaction.
+      const { executor } = target;
+      const insert = `INSERT INTO ${table} (id) VALUES ($1::text)`;
+      const seen = await executor.transaction(async (tx) => {
+        const joined = executor.wrapTransaction(tx.native);
+        if (joined.native !== tx.native) {
+          throw new Error("wrapTransaction() of a transaction's native: expected that native back, as it was given, got another object");
+        }
+        await joined.query(insert, ['kept']);
+        return ids(tx, table);
+      });
+      equal(seen, ['kept'], "the rows a transaction sees after a write through wrapTransaction() of its native");
+      equal(await ids(executor, table), ['kept'], "the rows after that transaction committed");
+
+      const failure = new Error('changed my mind');
+      let before: string[] = [];
+      const rolledBack = await rejection(
+        executor.transaction(async (tx) => {
+          await executor.wrapTransaction(tx.native).query(insert, ['undone']);
+          before = await ids(tx, table);
+          throw failure;
+        }),
+        "a transaction whose work rejects after a write through wrapTransaction() of its native",
+      );
+      if (rolledBack !== failure) {
+        throw new Error(`a transaction whose work rejects after a write through wrapTransaction() of its native: expected it to reject with the work's error, got ${messages(rolledBack)}`);
+      }
+      equal(before, ['kept', 'undone'], "the rows a transaction sees after a write through wrapTransaction() of its native, before its work rejects");
+      equal(await ids(executor, table), ['kept'], "the rows after that transaction rolled back (the write through its native with it)");
     },
 
     async connections({ executor }) {

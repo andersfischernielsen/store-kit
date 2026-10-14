@@ -1,8 +1,9 @@
 /**
  * The executor contract checks what it claims: executors that each break one rule (ignore the isolation level, run
  * the work outside a transaction, commit work that caught a failed statement, join anything, share one connection
- * without taking turns, rename columns, inline parameters, wrap the work's error) fail the case that guards it, and
- * pass the others where they can.
+ * without taking turns, rename columns, inline parameters, wrap the work's error, set a transaction's native on one
+ * side only or to another object, or to one whose writes escape the transaction) fail the case that guards it, and
+ * pass the others where they can. An executor without native, which is optional, passes its case.
  */
 import pg from 'pg';
 import { fromPg, type SqlExecutor, type SqlTransaction } from '../../lib/postgres/index.js';
@@ -24,6 +25,7 @@ const CASE = {
   transactions: 'transaction() commits',
   isolation: 'transaction() runs at the isolation level',
   joins: "wrapTransaction() joins the application's transaction",
+  native: "a transaction's native is the client's own transaction object",
   connections: 'transactions keep to one connection',
   values: 'values keep their types',
 };
@@ -139,6 +141,78 @@ describe('sqlExecutorContract()', () => {
         }),
     });
     expect((await outcome(executor, CASE.transactions))?.message).toMatch(/^a transaction whose work rejects: expected it to reject with the work's error/);
+  });
+
+  it('passes an executor without native, which is optional, and fails one that sets it on one side only', async () => {
+    const bare = (tx: SqlTransaction): SqlTransaction => ({ query: (text, params) => tx.query(text, params), execute: (text, params) => tx.execute!(text, params) });
+    const without = broken({
+      transaction: (work, options) => client!.executor.transaction((tx) => work(bare(tx)), options),
+      wrapTransaction: (transaction) => bare(client!.executor.wrapTransaction(transaction)),
+    });
+    expect(await outcome(without, CASE.native)).toBeNull();
+    expect(await outcome(without, CASE.joins)).toBeNull();
+
+    const insideOnly = broken({ wrapTransaction: (transaction) => bare(client!.executor.wrapTransaction(transaction)) });
+    expect((await outcome(insideOnly, CASE.native))?.message).toBe("wrapTransaction(x).native: expected x, as it was given, got none, though transaction()'s transactions set one");
+    const outsideOnly = broken({ transaction: (work, options) => client!.executor.transaction((tx) => work(bare(tx)), options) });
+    expect((await outcome(outsideOnly, CASE.native))?.message).toBe(
+      "the native of a transaction transaction() opened: expected the client's own transaction object, as wrapTransaction() sets one, got none",
+    );
+  });
+
+  it("fails an executor whose native isn't the object given, or is the transaction itself", async () => {
+    const another = broken({ wrapTransaction: (transaction) => ({ ...client!.executor.wrapTransaction(transaction), native: {} }) });
+    expect((await outcome(another, CASE.native))?.message).toBe('wrapTransaction(x).native: expected x, as it was given, got another object');
+
+    // Another object for a transaction's own native only, while it runs: the application's come back as they were
+    // given (a pool hands its clients out again).
+    const natives = new WeakSet<object>();
+    const swapped = broken({
+      transaction: (work, options) =>
+        client!.executor.transaction(async (tx) => {
+          natives.add(tx.native as object);
+          try {
+            return await work(tx);
+          } finally {
+            natives.delete(tx.native as object);
+          }
+        }, options),
+      wrapTransaction: (transaction) => {
+        const joined = client!.executor.wrapTransaction(transaction);
+        return natives.has(transaction as object) ? { ...joined, native: {} } : joined;
+      },
+    });
+    expect((await outcome(swapped, CASE.native))?.message).toBe("wrapTransaction() of a transaction's native: expected that native back, as it was given, got another object");
+
+    const itself = broken({
+      transaction: (work, options) =>
+        client!.executor.transaction((tx) => {
+          const own: SqlTransaction = {
+            query: (text, params) => tx.query(text, params),
+            get native() {
+              return own;
+            },
+          };
+          return work(own);
+        }, options),
+    });
+    expect((await outcome(itself, CASE.native))?.message).toBe(
+      "the native of a transaction transaction() opened: expected the client's own transaction object, got that SqlTransaction itself",
+    );
+  });
+
+  it("fails an executor whose native's writes run outside the work's transaction, committed at once", async () => {
+    // A native of the executor's own making, whose statements wrapTransaction() runs on the pool.
+    const escaping = {};
+    const executor = broken({
+      transaction: (work, options) =>
+        client!.executor.transaction((tx) => work({ query: (text, params) => tx.query(text, params), execute: (text, params) => tx.execute!(text, params), native: escaping }), options),
+      wrapTransaction: (transaction) =>
+        transaction === escaping ? { query: (text, params) => client!.executor.query(text, params), native: escaping } : client!.executor.wrapTransaction(transaction),
+    });
+    expect((await outcome(executor, CASE.native))?.message).toBe(
+      'the rows after that transaction rolled back (the write through its native with it): expected ["kept"], got ["kept","undone"]',
+    );
   });
 
   it('disposes of each target after its case', async () => {

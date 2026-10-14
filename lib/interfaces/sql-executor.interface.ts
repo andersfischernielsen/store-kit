@@ -86,7 +86,7 @@ export interface SqlTransaction {
    *   callback-API pool's transactions hand out callback-API connections).
    *
    * `wrapTransaction(x).native` is `x`, as it was given. Every executor of the kit sets it; it's optional here, so an
-   * executor written without it still satisfies this interface.
+   * executor written without it still satisfies this interface (`sqlExecutorContract()` checks it where it's set).
    *
    * ```ts
    * const executor = fromDrizzle(db);
