@@ -159,6 +159,12 @@ describe('the clients each executor takes', () => {
         return own;
       });
       expect(native).toBeInstanceOf(mysqlCallbacks.PoolConnection);
+      const single = mysqlCallbacks.createConnection({ uri: database!.url });
+      try {
+        expect(await fromMysql2(single as never).transaction(async (tx) => tx.native === single)).toBe(true);
+      } finally {
+        await new Promise((resolve) => single.end(resolve));
+      }
 
       const pgPool = new pg.Pool({ connectionString: 'postgres://nobody@127.0.0.1:1/none' });
       expect(() => fromMysql2(pgPool as never)).toThrow(
