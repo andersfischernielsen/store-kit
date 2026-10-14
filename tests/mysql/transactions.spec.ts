@@ -2,8 +2,9 @@
  * A MySQL store's writes in the application's transaction, through each client's own transaction object (a mysql2
  * connection after beginTransaction(), Drizzle's `tx`, TypeORM's `EntityManager`, Prisma's transaction client,
  * Kysely's `trx`): they commit with the application's row, unseen by other connections until then, or roll back with
- * it; an insert that meets a known id is a no-op there, and the application's transaction goes on (MySQL rolls back the
- * statement, not the transaction). And what a store may assume of the application's transactions: REPEATABLE READ,
+ * it; the same object as the `native` of a transaction the executor opened, whose own API writes in it, as does a
+ * store given it; an insert that meets a known id is a no-op there, and the application's transaction goes on (MySQL
+ * rolls back the statement, not the transaction). And what a store may assume of the application's transactions: REPEATABLE READ,
  * MySQL's default, reads a snapshot, and a locking read sees the latest committed rows.
  */
 import { MySqlNoteStore } from '../fixtures/notes/mysql-note.store.js';
@@ -57,6 +58,29 @@ describe.each(targets)('$name', ({ schema, open }) => {
     expect(await orders(id)).toBe(0);
     expect(await store.get(id)).toBeNull();
     expect(await outside(`SELECT tag FROM ${schema}_note_tags WHERE note_id = ?`, [id])).toEqual([]);
+  });
+
+  it("hands the executor's own transaction the client's object as native, whose own API and a store given it write in that transaction", async () => {
+    const id = `${schema}-native`;
+    await client.executor.transaction(async (tx) => {
+      await client.insertOrder(tx.native, id);
+      expect(await store.addInTransaction(tx.native, { id, body: 'order placed', tags: ['orders'], createdAt: 1 })).toBe(true);
+      expect(await tx.query('SELECT id FROM orders WHERE id = ?', [id])).toEqual([{ id }]);
+      expect(await outside('SELECT id FROM orders WHERE id = ?', [id])).toEqual([]);
+    });
+    expect(await orders(id)).toBe(1);
+    expect(await store.get(id)).toEqual({ id, body: 'order placed', tags: ['orders'], archived: false, createdAt: 1 });
+
+    const undone = `${schema}-native-undone`;
+    await expect(
+      client.executor.transaction(async (tx) => {
+        await client.insertOrder(tx.native, undone);
+        await store.addInTransaction(tx.native, { id: undone, body: 'order placed', tags: ['orders'], createdAt: 1 });
+        throw new Error('payment declined');
+      }),
+    ).rejects.toThrow('payment declined');
+    expect(await orders(undone)).toBe(0);
+    expect(await store.get(undone)).toBeNull();
   });
 
   it("adds a note it has as a no-op in the application's transaction, which goes on and commits: MySQL rolls back the statement, not the transaction", async () => {

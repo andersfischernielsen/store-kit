@@ -236,6 +236,7 @@ function clientTransaction(client: Pick<PgClientLike, 'query'>): SqlTransaction 
   return {
     query: async <R extends object>(text: string, params: readonly unknown[] = []) => (await client.query(text, [...params])).rows as R[],
     execute: async (text: string, params: readonly unknown[] = []) => affected(await client.query(text, [...params])),
+    native: client,
   };
 }
 

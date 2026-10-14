@@ -70,6 +70,33 @@ export interface SqlTransaction {
    * still satisfies this interface. For a statement that returns rows, use `query()`.
    */
   execute?(text: string, params?: readonly unknown[]): Promise<SqlExecuteResult>;
+  /**
+   * The client's own transaction object this transaction runs on: the kind the application's code holds, which
+   * `SqlExecutor.wrapTransaction()` takes. With it, a store that opens a transaction (`executor.transaction()`) can
+   * hand its caller the application's kind of object, whose own API (an ORM's queries, a client's `query()`) writes in
+   * that transaction. Per client:
+   * - node-postgres: the client in its transaction, after `BEGIN` (a pool's `PoolClient`, or the `Client` given to
+   *   `fromPg()`).
+   * - Drizzle: the `tx` that `db.transaction()` hands its callback.
+   * - TypeORM: the `EntityManager` that `dataSource.transaction()` hands its callback (or the `QueryRunner` given to
+   *   `wrapTransaction()`).
+   * - Prisma: the transaction client that `prisma.$transaction(async (tx) => ...)` hands its callback.
+   * - Kysely: the `Transaction` that `db.transaction().execute()` hands its callback (its plugins included).
+   * - mysql2: the connection in its transaction, after `START TRANSACTION`, of the API `fromMysql2()` was given (a
+   *   callback-API pool's transactions hand out callback-API connections).
+   *
+   * `wrapTransaction(x).native` is `x`, as it was given. Every executor of the kit sets it; it's optional here, so an
+   * executor written without it still satisfies this interface.
+   *
+   * ```ts
+   * const executor = fromDrizzle(db);
+   * await executor.transaction(async (tx) => {
+   *   await (tx.native as typeof db).insert(orders).values(order); // Drizzle's tx: the same transaction
+   *   await tx.query('INSERT INTO audit (order_id) VALUES ($1::text)', [order.id]);
+   * });
+   * ```
+   */
+  readonly native?: unknown;
 }
 
 /**
@@ -122,8 +149,9 @@ export interface SqlExecutor<D extends SqlDialect = SqlDialect> {
   /**
    * The application's transaction object (Drizzle's `tx`, a TypeORM `EntityManager`, a Prisma transaction client, a
    * Kysely `Transaction`, a node-postgres client after `BEGIN`, a mysql2 connection after `START TRANSACTION`), so
-   * statements run in it and commit or roll back with the application's own writes. Throws a `TypeError` for anything
-   * else, such as the database or pool itself. The kit's executors give that `TypeError` the `code`
+   * statements run in it and commit or roll back with the application's own writes; the object comes back as the
+   * `SqlTransaction`'s `native`, as it was given. Throws a `TypeError` for anything else, such as the database or pool
+   * itself. The kit's executors give that `TypeError` the `code`
    * `'ERR_SQL_NOT_A_TRANSACTION'` (`isNotATransactionError()` recognizes it), which a store can turn into its own
    * error: mysql2's executor throws it from the transaction's first statement, as only the server knows whether the
    * connection is in a transaction.

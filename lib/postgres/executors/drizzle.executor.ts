@@ -74,6 +74,7 @@ function drizzleTransaction(tx: DrizzleDatabaseLike): SqlTransaction {
   return {
     query: <R extends object>(text: string, params: readonly unknown[] = []) => run<R>(tx, text, params),
     execute: (text: string, params: readonly unknown[] = []) => write(tx, text, params),
+    native: tx,
   };
 }
 

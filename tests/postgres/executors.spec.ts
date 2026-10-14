@@ -6,7 +6,7 @@
  * and between two), Kysely's plugins, Prisma's transaction limits.
  */
 import { PrismaPg } from '@prisma/adapter-pg';
-import { CamelCasePlugin, Kysely, MysqlDialect, PostgresAdapter, PostgresDialect, SqliteDialect } from 'kysely';
+import { CamelCasePlugin, Kysely, MysqlDialect, PostgresAdapter, PostgresDialect, SqliteDialect, sql } from 'kysely';
 import mysql from 'mysql2/promise';
 import pg from 'pg';
 import { isNotATransactionError as fromTheRoot } from '../../lib/index.js';
@@ -41,6 +41,7 @@ async function openSingleClient(url: string): Promise<Client> {
     insertOrder: async (tx, id) => {
       await (tx as pg.Client).query("INSERT INTO orders (id, status) VALUES ($1, 'placed')", [id]);
     },
+    isNative: (value) => value === client,
     close: () => client.end(),
   };
 }
@@ -92,6 +93,14 @@ describe.each(targets)('$name', ({ open, skip }) => {
       expect(refusal).toMatchObject({ name: 'TypeError', code: 'ERR_SQL_NOT_A_TRANSACTION' });
       expect(isNotATransactionError(refusal)).toBe(true);
     }
+  });
+
+  it("hands its transactions' work the client's own transaction object as native, and gives the application's back as it was given", async () => {
+    expect(await client.executor.transaction(async (tx) => client.isNative(tx.native))).toBe(true);
+    await client.transaction(async (tx) => {
+      expect(client.isNative(tx)).toBe(true);
+      expect(client.executor.wrapTransaction(tx).native).toBe(tx);
+    });
   });
 });
 
@@ -186,6 +195,9 @@ describe('the clients each executor takes', () => {
       const runner = (manager.connection as { createQueryRunner(): any }).createQueryRunner();
       await runner.startTransaction();
       expect(await typeorm.executor.wrapTransaction(runner).query('SELECT 1::text AS one')).toEqual([{ one: '1' }]);
+      // The native is what was given: the runner, or its manager.
+      expect(typeorm.executor.wrapTransaction(runner).native).toBe(runner);
+      expect(typeorm.executor.wrapTransaction(runner.manager).native).toBe(runner.manager);
       await runner.rollbackTransaction();
       expect(() => typeorm.executor.wrapTransaction(runner)).toThrow('Pass the EntityManager your dataSource.transaction() callback receives');
       await runner.release();
@@ -217,12 +229,18 @@ describe('the clients each executor takes', () => {
     }
   });
 
-  it("fromKysely() takes the Kysely instance, not a transaction, and runs the store's statements without its plugins", async () => {
+  it("fromKysely() takes the Kysely instance, not a transaction, and runs the store's statements without its plugins, not its transactions' native", async () => {
     const db = new Kysely<object>({ dialect: new PostgresDialect({ pool: new pg.Pool({ connectionString: database!.url, max: 2 }) }), plugins: [new CamelCasePlugin()] });
     try {
       const executor = fromKysely(db);
       expect(await executor.query('SELECT 1::text AS lease_until')).toEqual([{ lease_until: '1' }]);
       expect(await executor.transaction((tx) => tx.query('SELECT 1::text AS lease_until'))).toEqual([{ lease_until: '1' }]);
+      // The native is the application's trx, plugins and all, in the same transaction as the store's statements.
+      const [native, store] = await executor.transaction(async (tx) => [
+        (await sql<object>`SELECT 1::text AS lease_until, txid_current()::text AS tx_id`.execute(tx.native as Kysely<object>)).rows,
+        await tx.query('SELECT txid_current()::text AS tx_id'),
+      ]);
+      expect(native).toEqual([{ leaseUntil: '1', txId: (store[0] as { tx_id: string }).tx_id }]);
       await db.transaction().execute(async (trx) => {
         expect(await executor.wrapTransaction(trx).query('SELECT 1::text AS lease_until')).toEqual([{ lease_until: '1' }]);
         expect(() => fromKysely(trx as never)).toThrow('fromKysely() takes the Kysely instance, not a transaction');

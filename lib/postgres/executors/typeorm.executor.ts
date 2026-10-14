@@ -80,7 +80,7 @@ class TypeOrmExecutor implements SqlExecutor<'postgres'> {
   }
 
   async transaction<T>(work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions = {}): Promise<T> {
-    const inTransaction = (manager: TypeOrmEntityManagerLike) => runTransactionWork(work, runnerTransaction(manager.queryRunner!));
+    const inTransaction = (manager: TypeOrmEntityManagerLike) => runTransactionWork(work, runnerTransaction(manager.queryRunner!, manager));
     return options.isolationLevel ? this.dataSource.transaction(isolationSql(options.isolationLevel), inTransaction) : this.dataSource.transaction(inTransaction);
   }
 
@@ -98,14 +98,16 @@ class TypeOrmExecutor implements SqlExecutor<'postgres'> {
     if (type !== undefined && type !== 'postgres') {
       throw notATransaction(`Pass the EntityManager of a DataSource of type 'postgres', not '${String(type)}': the store's statements run on PostgreSQL.`);
     }
-    return runnerTransaction(runner);
+    return runnerTransaction(runner, transaction);
   }
 }
 
-function runnerTransaction(runner: TypeOrmQueryRunnerLike): SqlTransaction {
+/** Statements on `runner`; `native` is what the application holds: the `EntityManager`, or the `QueryRunner` given. */
+function runnerTransaction(runner: TypeOrmQueryRunnerLike, native: unknown): SqlTransaction {
   return {
     query: <R extends object>(text: string, params: readonly unknown[] = []) => run<R>(runner, text, params),
     execute: (text: string, params: readonly unknown[] = []) => write(runner, text, params),
+    native,
   };
 }
 
