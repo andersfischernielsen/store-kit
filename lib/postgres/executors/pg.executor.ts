@@ -6,6 +6,9 @@ import { describeValue, hasMethod, isMysql2Client, isolationSql } from '../../ut
 export interface PgClientLike {
   query(text: string, values?: any[]): Promise<{ rows: any[]; rowCount?: number | null }>;
   connect(): Promise<unknown>;
+  /** A `PoolClient` is an `EventEmitter`: a pool transaction listens for its `error` while it holds the connection. */
+  on?(event: 'error', listener: (error: Error) => void): unknown;
+  removeListener?(event: 'error', listener: (error: Error) => void): unknown;
 }
 
 /** The part of a node-postgres `Pool` the executor uses. */
@@ -21,6 +24,7 @@ export interface PgPoolLike {
  *
  * ```ts
  * const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+ * pool.on('error', (error) => logger.error(error)); // an idle connection's error, which would end the process
  * const executor = fromPg(pool); // a first-party store's `executor` option
  *
  * // The application's transaction, for a store method that takes one: the client it runs on
@@ -69,10 +73,18 @@ class PgPoolExecutor implements SqlExecutor<'postgres'> {
 
   async transaction<T>(work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions = {}): Promise<T> {
     const client = await this.pool.connect();
+    // The pool listens to a connection's errors only while it's idle, and the client emits 'error' when the server ends
+    // the connection (a restart, a failover), during a statement too: an 'error' nothing listens to ends the process.
+    let lost: Error | undefined;
+    const onError = (error: Error) => {
+      lost ??= error;
+    };
+    client.on?.('error', onError);
     const outcome = await runTransaction(client, work, options);
+    client.removeListener?.('error', onError);
 
-    // A connection whose transaction can't be ended cleanly goes away rather than back to the pool.
-    client.release(outcome.broken);
+    // A connection whose transaction can't be ended cleanly, or that failed, goes away rather than back to the pool.
+    client.release(outcome.broken ?? lost);
     if ('error' in outcome) {
       throw outcome.error;
     }
