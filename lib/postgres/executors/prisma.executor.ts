@@ -2,6 +2,7 @@ import type { SqlExecuteResult, SqlExecutor, SqlTransaction, SqlTransactionOptio
 import { notATransaction } from '../../sql/not-a-transaction.js';
 import { parseDuration, type Duration } from '../../utils/duration.util.js';
 import { describeValue, hasMethod, isolationSql } from '../../utils/executor.util.js';
+import { runTransactionWork } from './transaction-work.js';
 
 /** The part of a Prisma client (or of the transaction client `$transaction()` hands its callback) the executor uses. */
 export interface PrismaClientLike {
@@ -84,7 +85,7 @@ class PrismaExecutor implements SqlExecutor<'postgres'> {
   }
 
   async transaction<T>(work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions = {}): Promise<T> {
-    return this.prisma.$transaction((tx: PrismaClientLike) => work(prismaTransaction(tx)), {
+    return this.prisma.$transaction((tx: PrismaClientLike) => runTransactionWork(work, prismaTransaction(tx)), {
       ...this.limits,
       ...(options.isolationLevel ? { isolationLevel: PRISMA_ISOLATION[isolationSql(options.isolationLevel)] } : {}),
     });

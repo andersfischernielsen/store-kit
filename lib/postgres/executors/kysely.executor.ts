@@ -1,6 +1,7 @@
 import type { SqlExecuteResult, SqlExecutor, SqlIsolationLevel, SqlTransaction, SqlTransactionOptions } from '../../interfaces/sql-executor.interface.js';
 import { notATransaction } from '../../sql/not-a-transaction.js';
 import { describeValue, hasMethod, isolationSql } from '../../utils/executor.util.js';
+import { runTransactionWork } from './transaction-work.js';
 
 /** The part of a Kysely instance (or of a `Transaction`) the executor uses. */
 export interface KyselyLike {
@@ -59,7 +60,7 @@ class KyselyExecutor implements SqlExecutor<'postgres'> {
 
   async transaction<T>(work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions = {}): Promise<T> {
     const builder = this.db.transaction();
-    const inTransaction = (trx: KyselyLike) => work(kyselyTransaction(trx));
+    const inTransaction = (trx: KyselyLike) => runTransactionWork(work, kyselyTransaction(trx));
     if (!options.isolationLevel) {
       return builder.execute(inTransaction);
     }

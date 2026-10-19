@@ -1,6 +1,7 @@
 import type { SqlExecuteResult, SqlExecutor, SqlTransaction, SqlTransactionOptions } from '../../interfaces/sql-executor.interface.js';
 import { notATransaction } from '../../sql/not-a-transaction.js';
 import { describeValue, hasMethod, isMysql2Client, isolationSql } from '../../utils/executor.util.js';
+import { runTransactionWork } from './transaction-work.js';
 
 /** The part of a node-postgres `Client` (or `PoolClient`) the executor uses. */
 export interface PgClientLike {
@@ -81,6 +82,7 @@ class PgPoolExecutor implements SqlExecutor<'postgres'> {
   }
 
   async transaction<T>(work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions = {}): Promise<T> {
+    const begin = beginSql(options);
     // The pool listens to a connection's errors only while it's idle, and the client emits 'error' when the server ends
     // the connection (a restart, a failover), during a statement too: an 'error' nothing listens to ends the process.
     // The transaction listens from the tick the pool hands the connection out in, as an `await` would resume too late:
@@ -102,8 +104,11 @@ class PgPoolExecutor implements SqlExecutor<'postgres'> {
     );
     // A statement after the connection is lost fails with what ended it (the server's 25P03 or 57P01, a reset...),
     // rather than with pg's "Client has encountered a connection error and is not queryable".
-    const connection = { query: (text: string, values?: any[]) => (lost ? Promise.reject(lost) : client.query(text, values)) };
-    const outcome = await runTransaction(connection, work, options);
+    const connection = {
+      query: (text: string, values?: any[]) => (lost ? Promise.reject(lost) : client.query(text, values)),
+      getTransactionStatus: () => (client as TransactionStatusLike).getTransactionStatus?.() ?? null,
+    };
+    const outcome = await runTransaction(connection, work, begin);
     client.removeListener?.('error', onError);
 
     // A connection whose transaction can't be ended cleanly, or that failed, goes away rather than back to the pool.
@@ -133,9 +138,10 @@ class PgClientExecutor implements SqlExecutor<'postgres'> {
     return this.exclusive(async () => affected(await this.client.query(text, [...params])));
   }
 
-  transaction<T>(work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions = {}): Promise<T> {
+  async transaction<T>(work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions = {}): Promise<T> {
+    const begin = beginSql(options);
     return this.exclusive(async () => {
-      const outcome = await runTransaction(this.client, work, options);
+      const outcome = await runTransaction(this.client, work, begin);
       if ('error' in outcome) {
         throw outcome.error;
       }
@@ -161,16 +167,24 @@ class PgClientExecutor implements SqlExecutor<'postgres'> {
 
 type Outcome<T> = { result: T; broken?: Error } | { error: unknown; broken?: Error };
 
-async function runTransaction<T>(client: Pick<PgClientLike, 'query'>, work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions): Promise<Outcome<T>> {
+/** node-postgres 8.21 and later: the connection's transaction status from its last ReadyForQuery ('I', 'T' or 'E'). */
+type TransactionStatusLike = { getTransactionStatus?(): string | null };
+
+/** The transaction's BEGIN, checked before it takes a connection: an unknown isolation level needs none to be refused. */
+function beginSql(options: SqlTransactionOptions): string {
+  return options.isolationLevel ? `BEGIN ISOLATION LEVEL ${isolationSql(options.isolationLevel)}` : 'BEGIN';
+}
+
+async function runTransaction<T>(client: Pick<PgClientLike, 'query'> & TransactionStatusLike, work: (transaction: SqlTransaction) => Promise<T>, begin: string): Promise<Outcome<T>> {
   try {
-    await client.query(options.isolationLevel ? `BEGIN ISOLATION LEVEL ${isolationSql(options.isolationLevel)}` : 'BEGIN');
+    await client.query(begin);
   } catch (error) {
     return { error, broken: asError(error) };
   }
 
   let result: T;
   try {
-    result = await work(clientTransaction(client));
+    result = await runTransactionWork(work, clientTransaction(client));
   } catch (error) {
     try {
       await client.query('ROLLBACK');
@@ -184,8 +198,13 @@ async function runTransaction<T>(client: Pick<PgClientLike, 'query'>, work: (tra
     await client.query('COMMIT');
     return { result };
   } catch (error) {
-    // PostgreSQL ends a transaction whose COMMIT fails; a lost connection is broken too.
-    return { error, broken: asError(error) };
+    // PostgreSQL ends a transaction whose COMMIT fails (a serialization failure, a deferred constraint): the connection
+    // is idle and goes back to the pool once a statement shows it is. A lost one is broken.
+    const idle = await client.query('SELECT 1').then(
+      () => (client.getTransactionStatus?.() ?? 'I') === 'I',
+      () => false,
+    );
+    return idle ? { error } : { error, broken: asError(error) };
   }
 }
 
@@ -200,7 +219,7 @@ function pgTransaction(transaction: unknown): SqlTransaction {
     );
   }
 
-  const client = transaction as PgClientLike & { getTransactionStatus?(): string | null };
+  const client = transaction as PgClientLike & TransactionStatusLike;
   if (typeof client.getTransactionStatus === 'function') {
     const status = client.getTransactionStatus();
     if (status === 'E') {
