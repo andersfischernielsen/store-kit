@@ -6,12 +6,20 @@ import { describeValue, hasMethod, isMysql2Client, isolationSql } from '../../ut
 export interface PgClientLike {
   query(text: string, values?: any[]): Promise<{ rows: any[]; rowCount?: number | null }>;
   connect(): Promise<unknown>;
+  /** A `PoolClient` is an `EventEmitter`: a pool transaction listens for its `error` while it holds the connection. */
+  on?(event: 'error', listener: (error: Error) => void): unknown;
+  removeListener?(event: 'error', listener: (error: Error) => void): unknown;
 }
+
+/** A connection a node-postgres `Pool` hands out. */
+type PgPoolClientLike = PgClientLike & { release(error?: Error | boolean): void };
 
 /** The part of a node-postgres `Pool` the executor uses. */
 export interface PgPoolLike {
   query(text: string, values?: any[]): Promise<{ rows: any[]; rowCount?: number | null }>;
-  connect(): Promise<PgClientLike & { release(error?: Error | boolean): void }>;
+  connect(): Promise<PgPoolClientLike>;
+  /** pg-pool calls back in the tick it hands the connection out, the one it stops listening to its errors in. */
+  connect(callback: (error: Error | undefined, client: PgPoolClientLike | undefined) => void): void;
   readonly totalCount: number;
 }
 
@@ -21,6 +29,10 @@ export interface PgPoolLike {
  *
  * ```ts
  * const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+ * // A connection's error, which would end the process: the pool listens only while it's idle, so each connection
+ * // listens too, for the transactions the application runs on one (a store's own transactions listen themselves)
+ * pool.on('error', (error) => logger.error(error));
+ * pool.on('connect', (client) => client.on('error', (error) => logger.error(error)));
  * const executor = fromPg(pool); // a first-party store's `executor` option
  *
  * // The application's transaction, for a store method that takes one: the client it runs on
@@ -40,7 +52,8 @@ export interface PgPoolLike {
  * ```
  *
  * The transaction object is a client (not the pool) in a transaction; with `pg` 8.21 or later, one that isn't (no
- * `BEGIN` yet, or a failed transaction) is refused as well.
+ * `BEGIN` yet, or a failed transaction) is refused as well. A connected `Client` given to `fromPg()` needs a
+ * `client.on('error', ...)` of the application's, as any `Client` does.
  */
 export function fromPg(pool: PgPoolLike | PgClientLike): SqlExecutor<'postgres'> {
   if (isMysql2Client(pool)) {
@@ -68,11 +81,33 @@ class PgPoolExecutor implements SqlExecutor<'postgres'> {
   }
 
   async transaction<T>(work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions = {}): Promise<T> {
-    const client = await this.pool.connect();
-    const outcome = await runTransaction(client, work, options);
+    // The pool listens to a connection's errors only while it's idle, and the client emits 'error' when the server ends
+    // the connection (a restart, a failover), during a statement too: an 'error' nothing listens to ends the process.
+    // The transaction listens from the tick the pool hands the connection out in, as an `await` would resume too late:
+    // the pool can hand it out while it reads from the socket, and the rest of that read (the server's FATAL right
+    // after a ReadyForQuery) is handled first.
+    let lost: Error | undefined;
+    const onError = (error: Error) => {
+      lost ??= error;
+    };
+    const client = await new Promise<PgPoolClientLike>((resolve, reject) =>
+      this.pool.connect((error, client) => {
+        if (error || !client) {
+          reject(error);
+          return;
+        }
+        client.on?.('error', onError);
+        resolve(client);
+      }),
+    );
+    // A statement after the connection is lost fails with what ended it (the server's 25P03 or 57P01, a reset...),
+    // rather than with pg's "Client has encountered a connection error and is not queryable".
+    const connection = { query: (text: string, values?: any[]) => (lost ? Promise.reject(lost) : client.query(text, values)) };
+    const outcome = await runTransaction(connection, work, options);
+    client.removeListener?.('error', onError);
 
-    // A connection whose transaction can't be ended cleanly goes away rather than back to the pool.
-    client.release(outcome.broken);
+    // A connection whose transaction can't be ended cleanly, or that failed, goes away rather than back to the pool.
+    client.release(outcome.broken ?? lost);
     if ('error' in outcome) {
       throw outcome.error;
     }
@@ -126,7 +161,7 @@ class PgClientExecutor implements SqlExecutor<'postgres'> {
 
 type Outcome<T> = { result: T; broken?: Error } | { error: unknown; broken?: Error };
 
-async function runTransaction<T>(client: PgClientLike, work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions): Promise<Outcome<T>> {
+async function runTransaction<T>(client: Pick<PgClientLike, 'query'>, work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions): Promise<Outcome<T>> {
   try {
     await client.query(options.isolationLevel ? `BEGIN ISOLATION LEVEL ${isolationSql(options.isolationLevel)}` : 'BEGIN');
   } catch (error) {
@@ -178,7 +213,7 @@ function pgTransaction(transaction: unknown): SqlTransaction {
   return clientTransaction(client);
 }
 
-function clientTransaction(client: PgClientLike): SqlTransaction {
+function clientTransaction(client: Pick<PgClientLike, 'query'>): SqlTransaction {
   return {
     query: async <R extends object>(text: string, params: readonly unknown[] = []) => (await client.query(text, [...params])).rows as R[],
     execute: async (text: string, params: readonly unknown[] = []) => affected(await client.query(text, [...params])),
