@@ -114,7 +114,9 @@ export interface SqlExecutor<D extends SqlDialect = SqlDialect> {
   execute?(text: string, params?: readonly unknown[]): Promise<SqlExecuteResult>;
   /**
    * Runs `work` in a transaction of its own, on one connection: commits when `work` resolves, rolls back and rethrows
-   * when it rejects.
+   * when it rejects. On PostgreSQL, which ends a transaction at its first failed statement, `work` that caught a
+   * statement's error and resolved without a `ROLLBACK TO SAVEPOINT` rolls back and rejects as well: nothing of it
+   * could commit.
    */
   transaction<T>(work: (transaction: SqlTransaction) => Promise<T>, options?: SqlTransactionOptions): Promise<T>;
   /**

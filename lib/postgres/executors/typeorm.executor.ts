@@ -1,6 +1,7 @@
 import type { SqlExecuteResult, SqlExecutor, SqlTransaction, SqlTransactionOptions } from '../../interfaces/sql-executor.interface.js';
 import { notATransaction } from '../../sql/not-a-transaction.js';
 import { describeValue, hasMethod, isolationSql } from '../../utils/executor.util.js';
+import { runTransactionWork } from './transaction-work.js';
 
 /** The part of a TypeORM `QueryRunner` the executor uses. */
 export interface TypeOrmQueryRunnerLike {
@@ -79,7 +80,7 @@ class TypeOrmExecutor implements SqlExecutor<'postgres'> {
   }
 
   async transaction<T>(work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions = {}): Promise<T> {
-    const inTransaction = (manager: TypeOrmEntityManagerLike) => work(runnerTransaction(manager.queryRunner!));
+    const inTransaction = (manager: TypeOrmEntityManagerLike) => runTransactionWork(work, runnerTransaction(manager.queryRunner!));
     return options.isolationLevel ? this.dataSource.transaction(isolationSql(options.isolationLevel), inTransaction) : this.dataSource.transaction(inTransaction);
   }
 

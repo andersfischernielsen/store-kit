@@ -70,7 +70,28 @@ export const POSTGRES_CASES: DialectCases = {
         'a transaction whose statement fails',
       );
       includes(messages(duplicate), 'duplicate key', 'a transaction whose statement fails');
-      equal(await ids(executor, table), ['kept'], 'the rows after a committed transaction and two rolled back');
+
+      // PostgreSQL ends a transaction at its first failed statement, and answers its COMMIT with a ROLLBACK, no error:
+      // work that caught the statement's error and resolved must not look committed.
+      const swallowed = await rejection(
+        executor.transaction(async (tx) => {
+          await tx.query(`INSERT INTO ${table} (id) VALUES ($1::text)`, ['swallowed']);
+          await tx.query(`INSERT INTO ${table} (id) VALUES ($1::text)`, ['kept']).catch(() => undefined);
+          return 'resolved';
+        }),
+        'a transaction whose work catches a failed statement and resolves',
+      );
+      includes(messages(swallowed), 'duplicate key', 'a transaction whose work catches a failed statement and resolves');
+      equal(await ids(executor, table), ['kept'], 'the rows after a committed transaction and three rolled back');
+
+      const recovered = await executor.transaction(async (tx) => {
+        await tx.query('SAVEPOINT attempt');
+        await tx.query(`INSERT INTO ${table} (id) VALUES ($1::text)`, ['kept']).catch(() => tx.query('ROLLBACK TO SAVEPOINT attempt'));
+        await tx.query(`INSERT INTO ${table} (id) VALUES ($1::text)`, ['after-savepoint']);
+        return 'committed';
+      });
+      equal(recovered, 'committed', 'a transaction whose work rolled back to a savepoint after a failed statement');
+      equal(await ids(executor, table), ['after-savepoint', 'kept'], 'the rows after a transaction that rolled back to a savepoint');
       equal(await executor.transaction((tx) => tx.query("SELECT 'next'::text AS status")), [{ status: 'next' }], 'a transaction after failed ones');
     },
 

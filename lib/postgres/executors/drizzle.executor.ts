@@ -1,6 +1,7 @@
 import type { SqlExecuteResult, SqlExecutor, SqlIsolationLevel, SqlTransaction, SqlTransactionOptions } from '../../interfaces/sql-executor.interface.js';
 import { notATransaction } from '../../sql/not-a-transaction.js';
 import { describeValue, hasMethod, isolationSql } from '../../utils/executor.util.js';
+import { runTransactionWork } from './transaction-work.js';
 
 /** The part of a Drizzle PostgreSQL database (or its `tx`) the executor uses. */
 export interface DrizzleDatabaseLike {
@@ -54,7 +55,7 @@ class DrizzleExecutor implements SqlExecutor<'postgres'> {
     if (config) {
       isolationSql(config.isolationLevel);
     }
-    return this.db.transaction((tx) => work(drizzleTransaction(tx)), config);
+    return this.db.transaction((tx) => runTransactionWork(work, drizzleTransaction(tx)), config);
   }
 
   wrapTransaction(transaction: unknown): SqlTransaction {
