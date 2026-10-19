@@ -70,6 +70,7 @@ export const POSTGRES_CASES: DialectCases = {
         'a transaction whose statement fails',
       );
       includes(messages(duplicate), 'duplicate key', 'a transaction whose statement fails');
+      equal(await ids(executor, table), ['kept'], 'the rows after a committed transaction and two rolled back');
 
       // PostgreSQL ends a transaction at its first failed statement, and answers its COMMIT with a ROLLBACK, no error:
       // work that caught the statement's error and resolved must not look committed.
@@ -82,7 +83,7 @@ export const POSTGRES_CASES: DialectCases = {
         'a transaction whose work catches a failed statement and resolves',
       );
       includes(messages(swallowed), 'duplicate key', 'a transaction whose work catches a failed statement and resolves');
-      equal(await ids(executor, table), ['kept'], 'the rows after a committed transaction and three rolled back');
+      equal(await ids(executor, table), ['kept'], 'the rows after a transaction whose work caught a failed statement');
 
       const recovered = await executor.transaction(async (tx) => {
         await tx.query('SAVEPOINT attempt');

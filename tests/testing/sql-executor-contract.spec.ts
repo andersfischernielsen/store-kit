@@ -1,7 +1,8 @@
 /**
  * The executor contract checks what it claims: executors that each break one rule (ignore the isolation level, run
- * the work outside a transaction, join anything, share one connection without taking turns, rename columns, inline
- * parameters, wrap the work's error) fail the case that guards it, and pass the others where they can.
+ * the work outside a transaction, commit work that caught a failed statement, join anything, share one connection
+ * without taking turns, rename columns, inline parameters, wrap the work's error) fail the case that guards it, and
+ * pass the others where they can.
  */
 import pg from 'pg';
 import { fromPg, type SqlExecutor, type SqlTransaction } from '../../lib/postgres/index.js';
@@ -78,6 +79,11 @@ describe('sqlExecutorContract()', () => {
     const executor = broken({ transaction: (work) => work(client!.executor) });
     expect((await outcome(executor, CASE.transactions))?.message).toMatch(/^the rows after a committed transaction and two rolled back/);
     expect(await outcome(executor, CASE.connections)).not.toBeNull();
+  });
+
+  it('fails an executor that commits work which caught a failed statement, as if PostgreSQL had kept its transaction', async () => {
+    const executor = broken({ transaction: (work) => client!.transaction((tx) => work(client!.executor.wrapTransaction(tx))) });
+    expect((await outcome(executor, CASE.transactions))?.message).toMatch(/^a transaction whose work catches a failed statement and resolves: expected a rejection/);
   });
 
   it("fails an executor that joins anything, running statements outside the application's transaction", async () => {
