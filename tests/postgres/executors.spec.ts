@@ -2,7 +2,8 @@
  * The executors: the executor contract (`@nestjs/store-kit/testing`) through each of them on PostgreSQL (and through
  * fromPg() on a single node-postgres Client, and fromDrizzle() on PGlite), the words of their refusals, and each
  * client's particulars: what each takes as the application's client and transaction object (another database's
- * refused), a client in a failed transaction, Kysely's plugins, Prisma's transaction limits.
+ * refused), a client in a failed transaction, a connection the server ends in a pool transaction (during a statement
+ * and between two), Kysely's plugins, Prisma's transaction limits.
  */
 import { PrismaPg } from '@prisma/adapter-pg';
 import { CamelCasePlugin, Kysely, MysqlDialect, PostgresAdapter, PostgresDialect, SqliteDialect } from 'kysely';
@@ -229,6 +230,58 @@ describe('the clients each executor takes', () => {
       expect(() => fromKysely({} as never)).toThrow('fromKysely() takes a Kysely instance, got an object.');
     } finally {
       await db.destroy();
+    }
+  });
+});
+
+describe('fromPg() and a connection the server ends', () => {
+  onPostgres(reason);
+
+  it("fails the pool transaction on it with the server's error, with no uncaught 'error' event, and the pool drops it for a new one", async () => {
+    const pool = new pg.Pool({ connectionString: database!.url, max: 1 });
+    try {
+      const executor = fromPg(pool);
+      // pg_terminate_backend() ends the connection mid-statement, as a restart or a failover does: the statement fails
+      // (57P01), and the client, out of the pool, emits 'error' too: an uncaught exception unless something listens.
+      await expect(
+        executor.transaction(async (tx) => {
+          const pid = (await tx.query<{ pid: number }>('SELECT pg_backend_pid() AS pid'))[0]!.pid;
+          // Under the test's timeout: a termination that didn't happen fails on the statement's 57014, not on a timeout.
+          await tx.query("SET LOCAL statement_timeout = '10s'");
+          await Promise.all([tx.query('SELECT pg_sleep(30)'), database!.admin.query('SELECT pg_terminate_backend($1)', [pid])]);
+        }),
+      ).rejects.toMatchObject({ code: '57P01' });
+
+      expect(pool.totalCount).toBe(0);
+      expect(await executor.transaction((tx) => tx.query('SELECT 1::text AS one'))).toEqual([{ one: '1' }]);
+      // A connection the pool hands out has no listener left from a transaction (the pool takes its own off).
+      const client = await pool.connect();
+      const listeners = client.listenerCount('error');
+      client.release();
+      expect(listeners).toBe(0);
+    } finally {
+      await endPool(pool);
+    }
+  });
+
+  it("fails the pool transaction with the server's error when it ends the connection between two statements", async () => {
+    const pool = new pg.Pool({ connectionString: database!.url, max: 1 });
+    try {
+      const executor = fromPg(pool);
+      // The server ends a connection idle in a transaction with a FATAL no statement receives: the client emits 'error'
+      // with it, then again as the socket closes, both while the transaction holds the connection. The next statement
+      // fails with that FATAL (25P03), not with pg's "not queryable".
+      await expect(
+        executor.transaction(async (tx) => {
+          await tx.query("SET LOCAL idle_in_transaction_session_timeout = '50ms'");
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          await tx.query('SELECT 1');
+        }),
+      ).rejects.toMatchObject({ code: '25P03' });
+
+      expect(pool.totalCount).toBe(0);
+    } finally {
+      await endPool(pool);
     }
   });
 });
