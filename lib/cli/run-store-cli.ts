@@ -3,6 +3,7 @@ import type { CliStoreSchema } from '../interfaces/cli-store-schema.interface.js
 import type { StoreCliIo } from '../interfaces/store-cli-io.interface.js';
 import { DIALECT_NAMES, type SqlDialect } from '../schema/dialect.js';
 import { CLI_DIALECTS, URL_SCHEMES } from './cli-dialects.js';
+import { cliErrorMessage } from './cli-error-message.js';
 
 /**
  * A package's command for its stores' schemas (`npx @nestjs/outbox migrate|status|sql`), from a shell or a CI step:
@@ -44,6 +45,7 @@ export async function runStoreCli(schemas: readonly CliStoreSchema[], argv: read
     return name === undefined && !values.help ? 1 : 0;
   }
 
+  const url = values.url ?? io.env.DATABASE_URL;
   try {
     if (name === 'sql') {
       const schema = pick(schemas, dialectOption(values.dialect, schemas));
@@ -62,7 +64,6 @@ export async function runStoreCli(schemas: readonly CliStoreSchema[], argv: read
       return 1;
     }
 
-    const url = values.url ?? io.env.DATABASE_URL;
     if (!url) {
       io.err(`${command} ${name} needs the database: pass --url, or set DATABASE_URL.\n`);
       return 1;
@@ -97,7 +98,7 @@ export async function runStoreCli(schemas: readonly CliStoreSchema[], argv: read
       await database.close();
     }
   } catch (error) {
-    io.err(`${(error as Error)?.message ?? error}\n`);
+    io.err(`${cliErrorMessage(error, url)}\n`);
     return 1;
   }
 }

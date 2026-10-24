@@ -9,6 +9,7 @@ import type { CliStoreSchema } from '../../lib/interfaces/index.js';
 import { noteSchema } from '../fixtures/notes/note.schema.js';
 import { mysqlNoteSchema } from '../fixtures/notes/mysql-note.schema.js';
 import { onMysql, testDatabase } from './support.js';
+import { closedLocalhostPort } from '../support/closed-port.js';
 
 const { database, reason } = await testDatabase('cli');
 
@@ -71,6 +72,23 @@ describe('runStoreCli() and MySQL', () => {
     expect((await run(both, ['status', '--url', 'mariadb://admin:s3cret@db.internal/shop'])).err).toBe(
       'npx @nestjs/notes status takes a database URL that starts with postgres:// or postgresql:// or mysql://.\n',
     );
+  });
+
+  it("reports a MySQL it cannot reach on localhost with each address's error, never an empty line or the password", async () => {
+    const { port } = await closedLocalhostPort();
+    const result = await run(mysqlOnly, ['status', '--url', `mysql://root:s3cret@localhost:${port}/shop`]);
+    expect(result).toMatchObject({ code: 1, out: '' });
+    expect(result.err).toMatch(new RegExp(`^(connect ECONNREFUSED (::1|127\\.0\\.0\\.1):${port}\n)+$`));
+    expect(result.err).not.toContain('s3cret');
+  });
+
+  it("reports both of localhost's addresses where it is ::1 and 127.0.0.1: an AggregateError without a message of its own", async (context) => {
+    const { port, dualStackReason } = await closedLocalhostPort();
+    if (dualStackReason) {
+      context.skip(dualStackReason);
+    }
+    const result = await run(mysqlOnly, ['status', '--url', `mysql://root:s3cret@localhost:${port}/shop`]);
+    expect({ code: result.code, lines: result.err.split('\n').sort() }).toEqual({ code: 1, lines: ['', `connect ECONNREFUSED 127.0.0.1:${port}`, `connect ECONNREFUSED ::1:${port}`] });
   });
 
   describe('on MySQL', () => {
