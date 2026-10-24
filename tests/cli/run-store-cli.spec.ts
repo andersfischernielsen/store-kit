@@ -10,6 +10,7 @@ import { noteSchema, noteSchemaOptions } from '../fixtures/notes/note.schema.js'
 import { mysqlNoteSchema } from '../fixtures/notes/mysql-note.schema.js';
 import { StoreSchema } from '../../lib/postgres/index.js';
 import { onPostgres, testDatabase } from '../postgres/support.js';
+import { closedLocalhostPort } from '../support/closed-port.js';
 
 const { database, reason } = await testDatabase('cli');
 
@@ -147,6 +148,34 @@ Options:
     await expect(runStoreCli([noteSchema, noteSchema], ['sql'], io)).rejects.toThrow(message);
     await expect(runStoreCli([noteSchema, { ...noteSchema, dialect: 'mysql', command: 'nest-other' } as never], ['sql'], io)).rejects.toThrow(message);
     expect(new StoreSchema({ ...noteSchemaOptions }).dialect).toBe('postgres');
+  });
+
+  it("reports a database it cannot reach on localhost with each address's error, never an empty line or the password", async () => {
+    const { port } = await closedLocalhostPort();
+    const result = await run(['status', '--url', `postgres://shop:s3cret@localhost:${port}/shop`]);
+    expect(result).toMatchObject({ code: 1, out: '' });
+    expect(result.err).toMatch(new RegExp(`^(connect ECONNREFUSED (::1|127\\.0\\.0\\.1):${port}\n)+$`));
+    expect(result.err).not.toContain('s3cret');
+  });
+
+  it("reports both of localhost's addresses where it is ::1 and 127.0.0.1: an AggregateError without a message of its own", async (context) => {
+    const { port, dualStackReason } = await closedLocalhostPort();
+    if (dualStackReason) {
+      context.skip(dualStackReason);
+    }
+    const result = await run(['status', '--url', `postgres://shop:s3cret@localhost:${port}/shop`]);
+    expect({ code: result.code, lines: result.err.split('\n').sort() }).toEqual({ code: 1, lines: ['', `connect ECONNREFUSED 127.0.0.1:${port}`, `connect ECONNREFUSED ::1:${port}`] });
+  });
+
+  it('prints why a command failed when the error has no message of its own, without the password', async () => {
+    const failing = (error: unknown) => Object.create(noteSchema, { version: { value: async () => Promise.reject(error) } }) as CliStoreSchema;
+    const url = 'postgres://shop:s3cret@db.internal:5432/shop';
+    const refused = (address: string) => Object.assign(new Error(`connect ECONNREFUSED ${address}:5432`), { code: 'ECONNREFUSED', address, port: 5432 });
+    const aggregate = Object.assign(new AggregateError([refused('::1'), refused('127.0.0.1')], ''), { code: 'ECONNREFUSED' });
+    expect(await run(['status', '--url', url], {}, [failing(aggregate)])).toEqual({ code: 1, out: '', err: 'connect ECONNREFUSED ::1:5432\nconnect ECONNREFUSED 127.0.0.1:5432\n' });
+    expect((await run(['status', '--url', url], {}, [failing(new Error('', { cause: refused('127.0.0.1') }))])).err).toBe('connect ECONNREFUSED 127.0.0.1:5432\n');
+    expect((await run(['status', '--url', url], {}, [failing({ code: 'ECONNRESET' })])).err).toBe('ECONNRESET\n');
+    expect((await run(['status', '--url', url], {}, [failing(new Error(`no route to ${url}`))])).err).toBe('no route to postgres://shop:***@db.internal:5432/shop\n');
   });
 
   describe('on PostgreSQL', () => {
