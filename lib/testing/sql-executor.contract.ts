@@ -92,7 +92,10 @@ const DIALECTS: Partial<Record<SqlExecutor['dialect'], DialectCases>> = {
  * on neither side (the transactions `transaction()` hands its work, and those `wrapTransaction()` makes) passes that
  * case, having checked only that; one that sets it on one side only fails it. Where it's set, a transaction's `native`
  * must be an object `wrapTransaction()` joins (a write through it is the work's: seen in its transaction, committed
- * with it, rolled back with its rejection), and `wrapTransaction(x).native` must be `x`, as it was given.
+ * with it, rolled back with its rejection), and `wrapTransaction(x).native` must be `x`, as it was given. On PostgreSQL,
+ * which ends a transaction at its first failed statement, a statement through it that fails must reject the work even
+ * when the work caught its error, nothing committed, as one through the transaction's `query()` must: the executor
+ * can't see it, so it asks PostgreSQL whether the transaction is still open (or reads its COMMIT's reply).
  *
  * ```ts
  * const cases = sqlExecutorContract(async () => ({

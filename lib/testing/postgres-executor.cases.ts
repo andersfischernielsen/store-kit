@@ -193,6 +193,18 @@ export const POSTGRES_CASES: DialectCases = {
       }
       equal(before, ['kept', 'undone'], "the rows a transaction sees after a write through wrapTransaction() of its native, before its work rejects");
       equal(await ids(executor, table), ['kept'], "the rows after that transaction rolled back (the write through its native with it)");
+
+      // PostgreSQL ends a transaction at its first failed statement, one sent through its native too, which the
+      // executor's own query() never saw: work that caught that statement's error and resolved must not look committed.
+      await rejection(
+        executor.transaction(async (tx) => {
+          await tx.query(insert, ['swallowed']);
+          await executor.wrapTransaction(tx.native).query(insert, ['kept']).catch(() => undefined);
+          return 'resolved';
+        }),
+        'a transaction whose work catches a failed statement sent through wrapTransaction() of its native, and resolves',
+      );
+      equal(await ids(executor, table), ['kept'], 'the rows after a transaction whose work caught a failed statement sent through its native');
     },
 
     async connections({ executor }) {

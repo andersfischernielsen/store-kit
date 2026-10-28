@@ -2,10 +2,12 @@
  * The executor contract checks what it claims: executors that each break one rule (ignore the isolation level, run
  * the work outside a transaction, commit work that caught a failed statement, join anything, share one connection
  * without taking turns, rename columns, inline parameters, wrap the work's error, set a transaction's native on one
- * side only or to another object, or to one whose writes escape the transaction) fail the case that guards it, and
- * pass the others where they can. An executor without native, which is optional, passes its case.
+ * side only or to another object, or to one whose writes escape the transaction, or watch the work's statements but
+ * not those sent through its native) fail the case that guards it, and pass the others where they can. An executor
+ * without native, which is optional, passes its case.
  */
 import pg from 'pg';
+import { runTransactionWork } from '../../lib/postgres/executors/transaction-work.js';
 import { fromPg, type SqlExecutor, type SqlTransaction } from '../../lib/postgres/index.js';
 import { sqlExecutorContract, type SqlExecutorContractTarget } from '../../lib/testing/index.js';
 import { endPool } from '../support/postgres.js';
@@ -86,6 +88,25 @@ describe('sqlExecutorContract()', () => {
   it('fails an executor that commits work which caught a failed statement, as if PostgreSQL had kept its transaction', async () => {
     const executor = broken({ transaction: (work) => client!.transaction((tx) => work(client!.executor.wrapTransaction(tx))) });
     expect((await outcome(executor, CASE.transactions))?.message).toMatch(/^a transaction whose work catches a failed statement and resolves: expected a rejection/);
+    expect((await outcome(executor, CASE.native))?.message).toMatch(
+      /^a transaction whose work catches a failed statement sent through wrapTransaction\(\) of its native, and resolves: expected a rejection/,
+    );
+  });
+
+  it("fails an executor that watches the work's statements but not those sent through its native, whose caught failure it commits", async () => {
+    // The work runner's object for the statements, and the client handed beside it as native, which the runner never
+    // sees read.
+    const executor = broken({
+      transaction: (work) =>
+        client!.transaction((tx) => {
+          const joined = client!.executor.wrapTransaction(tx);
+          return runTransactionWork((watched) => work({ query: watched.query, execute: watched.execute, native: tx }), { query: joined.query, execute: joined.execute });
+        }),
+    });
+    expect(await outcome(executor, CASE.transactions)).toBeNull();
+    expect((await outcome(executor, CASE.native))?.message).toMatch(
+      /^a transaction whose work catches a failed statement sent through wrapTransaction\(\) of its native, and resolves: expected a rejection/,
+    );
   });
 
   it("fails an executor that joins anything, running statements outside the application's transaction", async () => {
