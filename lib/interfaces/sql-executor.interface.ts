@@ -88,6 +88,11 @@ export interface SqlTransaction {
    * `wrapTransaction(x).native` is `x`, as it was given. Every executor of the kit sets it; it's optional here, so an
    * executor written without it still satisfies this interface (`sqlExecutorContract()` checks it where it's set).
    *
+   * Its statements don't pass through `query()`. PostgreSQL ends a transaction at its first failed statement, and
+   * answers its COMMIT with a ROLLBACK, no error, so the kit's PostgreSQL executors reject work that caught such a
+   * statement's error, nothing committed: node-postgres's reads its COMMIT's reply, at no cost; Drizzle's, Kysely's,
+   * Prisma's and TypeORM's send one statement at the work's end (`SELECT 1`) once the work read `native`.
+   *
    * ```ts
    * const executor = fromDrizzle(db);
    * await executor.transaction(async (tx) => {

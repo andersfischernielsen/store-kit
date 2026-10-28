@@ -3,7 +3,9 @@
  * fromPg() on a single node-postgres Client, and fromDrizzle() on PGlite), the words of their refusals, and each
  * client's particulars: what each takes as the application's client and transaction object (another database's
  * refused), a client in a failed transaction, a connection the server ends in a pool transaction (during a statement
- * and between two), Kysely's plugins, Prisma's transaction limits.
+ * and between two), Kysely's plugins, Prisma's transaction limits; and how fromPg() tells a transaction PostgreSQL
+ * ended at a statement the work sent through its native: from its COMMIT's reply, no statement more, or, for a client
+ * whose replies carry no command tag, with the work runner's statement at the work's end.
  */
 import { PrismaPg } from '@prisma/adapter-pg';
 import { CamelCasePlugin, Kysely, MysqlDialect, PostgresAdapter, PostgresDialect, SqliteDialect, sql } from 'kysely';
@@ -400,5 +402,76 @@ describe('the code of a refusal of anything but a transaction', () => {
       expect(recognizes(Object.assign(new Error('ECONNRESET'), { code: 'ECONNRESET' }))).toBe(false);
       expect([undefined, null, 'ERR_SQL_NOT_A_TRANSACTION'].map(recognizes)).toEqual([false, false, false]);
     }
+  });
+});
+
+describe('fromPg() and a transaction PostgreSQL ended at a statement through its native', () => {
+  /** A reply as node-postgres gives one: `command` is the statement's command tag. */
+  type Reply = { rows: unknown[]; rowCount?: number; command?: string };
+
+  /**
+   * A connected node-postgres Client as far as fromPg() can tell (no server behind it): it records each statement, and
+   * answers it as `answer` says, with a reply or an error.
+   */
+  const fake = (answer: (text: string) => Reply | Error) => {
+    const sent: string[] = [];
+    return {
+      sent,
+      connect: async () => undefined,
+      query: async (text: string): Promise<Reply> => {
+        sent.push(text);
+        const reply = answer(text);
+        if (reply instanceof Error) {
+          throw reply;
+        }
+        return reply;
+      },
+    };
+  };
+
+  it("reads its COMMIT's reply when the work read its native, no statement more: a ROLLBACK rejects the work", async () => {
+    // node-postgres's tags: BEGIN, then COMMIT for a transaction that committed, ROLLBACK for one PostgreSQL ended.
+    let ended = false;
+    const client = fake((text) => ({ rows: [], rowCount: 0, command: text === 'COMMIT' && ended ? 'ROLLBACK' : text.split(' ')[0] }));
+    const executor = fromPg(client as never);
+    expect(await executor.transaction(async (tx) => tx.native === client)).toBe(true);
+    expect(client.sent).toEqual(['BEGIN', 'COMMIT']);
+
+    client.sent.length = 0;
+    ended = true;
+    await expect(executor.transaction(async (tx) => tx.native !== undefined)).rejects.toThrow(
+      'The transaction was rolled back: one of its statements failed and its error was caught',
+    );
+    expect(client.sent).toEqual(['BEGIN', 'COMMIT']);
+  });
+
+  it("asks with a statement at the work's end, for a client whose replies carry no command tag, only when the work read its native", async () => {
+    // PostgreSQL fails any statement in a transaction it ended (25P02) but ROLLBACK.
+    const aborted = Object.assign(new Error('current transaction is aborted, commands ignored until end of transaction block'), { code: '25P02' });
+    let probeFails: Error | null = null;
+    const client = fake((text) => (probeFails && text === 'SELECT 1' ? probeFails : { rows: [], rowCount: 0 }));
+    const executor = fromPg(client as never);
+    const readsNative = () => executor.transaction(async (tx) => tx.native === client).catch((error: unknown) => error);
+    expect(await readsNative()).toBe(true);
+    expect(client.sent).toEqual(['BEGIN', 'SELECT 1', 'COMMIT']);
+
+    client.sent.length = 0;
+    probeFails = aborted;
+    const rejected = await readsNative();
+    expect(rejected).toBeInstanceOf(Error);
+    expect((rejected as Error).message).toMatch(/^The transaction was rolled back: one of its statements failed and its error was caught/);
+    expect((rejected as Error).cause).toBe(aborted);
+    expect(client.sent).toEqual(['BEGIN', 'SELECT 1', 'ROLLBACK']);
+
+    // A statement that fails otherwise (the connection lost): its own error.
+    const lost = Object.assign(new Error('Connection terminated unexpectedly'), { code: 'ECONNRESET' });
+    probeFails = lost;
+    expect(await readsNative()).toBe(lost);
+
+    // Work that didn't read its native gets no statement more.
+    client.sent.length = 0;
+    probeFails = null;
+    await executor.transaction((tx) => tx.query('SELECT 2'));
+    expect(client.sent).toEqual(['BEGIN', 'SELECT 2', 'COMMIT']);
   });
 });

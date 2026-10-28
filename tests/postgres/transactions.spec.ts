@@ -2,8 +2,9 @@
  * A store's writes in the application's transaction, through each client's own transaction object (node-postgres's
  * client after BEGIN, Drizzle's `tx`, TypeORM's `EntityManager`, Prisma's transaction client, Kysely's `trx`): they
  * commit with the application's row, unseen by other connections until then, or roll back with it. The same object as
- * the `native` of a transaction the executor opened: the client's own API writes in it, and so does a store given it.
- * And assertReadCommittedTransaction() refuses a transaction that isn't READ COMMITTED, with the store's words.
+ * the `native` of a transaction the executor opened: the client's own API writes in it, and so does a store given it; a
+ * write of its own API that fails, its error caught by the work, still rejects the transaction, nothing committed. And
+ * assertReadCommittedTransaction() refuses a transaction that isn't READ COMMITTED, with the store's words.
  */
 import { assertReadCommittedTransaction } from '../../lib/postgres/index.js';
 import { noteSchema } from '../fixtures/notes/note.schema.js';
@@ -89,6 +90,23 @@ describe.each(targets)('$name', ({ schema, open, postgres, skip }) => {
     ).rejects.toThrow('payment declined');
     expect(await orders(undone)).toBe(0);
     expect(await store.get(undone)).toBeNull();
+  });
+
+  it("rejects its own transaction whose work caught a failed write of the client's own API through native, nothing of the work committed", async () => {
+    const id = `${schema}-native-caught`;
+    const taken = `${schema}-native-taken`;
+    await client.transaction((tx) => client.insertOrder(tx, taken));
+    const caught = client.executor.transaction(async (tx) => {
+      await client.insertOrder(tx.native, id);
+      // The id again: PostgreSQL fails the statement, and ends the transaction with it; the work catches the error.
+      await client.insertOrder(tx.native, taken).catch(() => undefined);
+      return 'resolved';
+    });
+    await expect(caught).rejects.toThrow('The transaction was rolled back: one of its statements failed and its error was caught');
+    expect(await orders(id)).toBe(0);
+    // The next transaction commits: the connection came back usable.
+    await client.executor.transaction((tx) => client.insertOrder(tx.native, id));
+    expect(await orders(id)).toBe(1);
   });
 
   it("assertReadCommittedTransaction() refuses a transaction that isn't READ COMMITTED, in the store's words, and takes one that is", async () => {
