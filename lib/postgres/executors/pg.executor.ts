@@ -1,11 +1,14 @@
 import type { SqlExecuteResult, SqlExecutor, SqlTransaction, SqlTransactionOptions } from '../../interfaces/sql-executor.interface.js';
 import { notATransaction } from '../../sql/not-a-transaction.js';
 import { describeValue, hasMethod, isMysql2Client, isolationSql } from '../../utils/executor.util.js';
-import { runTransactionWork } from './transaction-work.js';
+import { runTransactionWork, transactionEnded } from './transaction-work.js';
 
-/** The part of a node-postgres `Client` (or `PoolClient`) the executor uses. */
+/**
+ * The part of a node-postgres `Client` (or `PoolClient`) the executor uses. A result's `command` is the statement's
+ * command tag, which tells a COMMIT that committed from one PostgreSQL answered with a ROLLBACK.
+ */
 export interface PgClientLike {
-  query(text: string, values?: any[]): Promise<{ rows: any[]; rowCount?: number | null }>;
+  query(text: string, values?: any[]): Promise<{ rows: any[]; rowCount?: number | null; command?: string }>;
   connect(): Promise<unknown>;
   /** A `PoolClient` is an `EventEmitter`: a pool transaction listens for its `error` while it holds the connection. */
   on?(event: 'error', listener: (error: Error) => void): unknown;
@@ -103,12 +106,13 @@ class PgPoolExecutor implements SqlExecutor<'postgres'> {
       }),
     );
     // A statement after the connection is lost fails with what ended it (the server's 25P03 or 57P01, a reset...),
-    // rather than with pg's "Client has encountered a connection error and is not queryable".
+    // rather than with pg's "Client has encountered a connection error and is not queryable". The work's native is the
+    // client itself, as the application holds one.
     const connection = {
       query: (text: string, values?: any[]) => (lost ? Promise.reject(lost) : client.query(text, values)),
       getTransactionStatus: () => (client as TransactionStatusLike).getTransactionStatus?.() ?? null,
     };
-    const outcome = await runTransaction(connection, work, begin);
+    const outcome = await runTransaction(connection, work, begin, client);
     client.removeListener?.('error', onError);
 
     // A connection whose transaction can't be ended cleanly, or that failed, goes away rather than back to the pool.
@@ -141,7 +145,7 @@ class PgClientExecutor implements SqlExecutor<'postgres'> {
   async transaction<T>(work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions = {}): Promise<T> {
     const begin = beginSql(options);
     return this.exclusive(async () => {
-      const outcome = await runTransaction(this.client, work, begin);
+      const outcome = await runTransaction(this.client, work, begin, this.client);
       if ('error' in outcome) {
         throw outcome.error;
       }
@@ -175,16 +179,28 @@ function beginSql(options: SqlTransactionOptions): string {
   return options.isolationLevel ? `BEGIN ISOLATION LEVEL ${isolationSql(options.isolationLevel)}` : 'BEGIN';
 }
 
-async function runTransaction<T>(client: Pick<PgClientLike, 'query'> & TransactionStatusLike, work: (transaction: SqlTransaction) => Promise<T>, begin: string): Promise<Outcome<T>> {
+/**
+ * BEGIN, the work, then COMMIT (or ROLLBACK when the work rejects), on `client`; `native` is the client the work gets as
+ * its transaction's own object. node-postgres replies to each statement with its command tag: the BEGIN's says the
+ * COMMIT's will tell (`ROLLBACK` for a transaction PostgreSQL ended), so the work's reading `native` costs no statement
+ * (`commitReplyTells`). A client whose replies carry no tag gets the work runner's statement at the end instead.
+ */
+async function runTransaction<T>(
+  client: Pick<PgClientLike, 'query'> & TransactionStatusLike,
+  work: (transaction: SqlTransaction) => Promise<T>,
+  begin: string,
+  native: unknown,
+): Promise<Outcome<T>> {
+  let tagged: boolean;
   try {
-    await client.query(begin);
+    tagged = (await client.query(begin)).command === 'BEGIN';
   } catch (error) {
     return { error, broken: asError(error) };
   }
 
   let result: T;
   try {
-    result = await runTransactionWork(work, clientTransaction(client));
+    result = await runTransactionWork(work, clientTransaction(client, native), { commitReplyTells: tagged });
   } catch (error) {
     try {
       await client.query('ROLLBACK');
@@ -195,7 +211,12 @@ async function runTransaction<T>(client: Pick<PgClientLike, 'query'> & Transacti
   }
 
   try {
-    await client.query('COMMIT');
+    // PostgreSQL answers the COMMIT of a transaction it ended at a failed statement (one the work sent through its
+    // native and caught, which the work runner doesn't see) with a ROLLBACK: nothing committed, the connection idle.
+    const committed = await client.query('COMMIT');
+    if (tagged && committed.command === 'ROLLBACK') {
+      return { error: transactionEnded() };
+    }
     return { result };
   } catch (error) {
     // PostgreSQL ends a transaction whose COMMIT fails (a serialization failure, a deferred constraint): the connection
@@ -229,13 +250,15 @@ function pgTransaction(transaction: unknown): SqlTransaction {
       throw notATransaction("The node-postgres client isn't in a transaction: send BEGIN on it first, or each statement commits on its own.");
     }
   }
-  return clientTransaction(client);
+  return clientTransaction(client, client);
 }
 
-function clientTransaction(client: Pick<PgClientLike, 'query'>): SqlTransaction {
+/** Statements on `client`; `native` is the client as the application holds it (a pool transaction's statements run through a wrapper of it). */
+function clientTransaction(client: Pick<PgClientLike, 'query'>, native: unknown): SqlTransaction {
   return {
     query: async <R extends object>(text: string, params: readonly unknown[] = []) => (await client.query(text, [...params])).rows as R[],
     execute: async (text: string, params: readonly unknown[] = []) => affected(await client.query(text, [...params])),
+    native,
   };
 }
 

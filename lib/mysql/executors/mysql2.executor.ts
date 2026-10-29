@@ -56,14 +56,19 @@ export function fromMysql2(pool: Mysql2PoolLike | Mysql2ConnectionLike): SqlExec
   }
 
   assertFoundRows(mysql2Flags(pool), 'fromMysql2()');
+  // The promise API runs the statements; a transaction's `native` is of the API the application gave.
   const client = promised(pool);
-  return hasMethod(client, 'getConnection') ? new Mysql2PoolExecutor(client as Mysql2PoolLike) : new Mysql2ConnectionExecutor(client);
+  return hasMethod(client, 'getConnection') ? new Mysql2PoolExecutor(client as Mysql2PoolLike, client !== pool) : new Mysql2ConnectionExecutor(client, pool);
 }
 
 class Mysql2PoolExecutor implements SqlExecutor {
   readonly dialect = 'mysql';
 
-  constructor(private readonly pool: Mysql2PoolLike) {}
+  /** `callbacks`: the pool given was of the callback API, so its transactions hand out callback-API connections. */
+  constructor(
+    private readonly pool: Mysql2PoolLike,
+    private readonly callbacks: boolean,
+  ) {}
 
   query<R extends object>(text: string, params: readonly unknown[] = []): Promise<R[]> {
     return rows<R>(this.pool, text, params);
@@ -76,7 +81,9 @@ class Mysql2PoolExecutor implements SqlExecutor {
   async transaction<T>(work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions = {}): Promise<T> {
     const isolation = options.isolationLevel ? isolationSql(options.isolationLevel) : undefined;
     const connection = await this.pool.getConnection();
-    const outcome = await runTransaction(connection, work, isolation);
+    // A promise-API connection wraps the callback-API one (`connection`), which the application's own code holds.
+    const native = this.callbacks ? ((connection as { connection?: unknown }).connection ?? connection) : connection;
+    const outcome = await runTransaction(connection, work, isolation, native);
 
     // A connection whose transaction can't be ended cleanly goes away rather than back to the pool.
     if (outcome.broken) {
@@ -99,7 +106,11 @@ class Mysql2ConnectionExecutor implements SqlExecutor {
   readonly dialect = 'mysql';
   private tail: Promise<unknown> = Promise.resolve();
 
-  constructor(private readonly connection: Mysql2ConnectionLike) {}
+  /** `native`: the connection as `fromMysql2()` was given it, of either API. */
+  constructor(
+    private readonly connection: Mysql2ConnectionLike,
+    private readonly native: unknown,
+  ) {}
 
   query<R extends object>(text: string, params: readonly unknown[] = []): Promise<R[]> {
     return this.exclusive(() => rows<R>(this.connection, text, params));
@@ -112,7 +123,7 @@ class Mysql2ConnectionExecutor implements SqlExecutor {
   async transaction<T>(work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions = {}): Promise<T> {
     const isolation = options.isolationLevel ? isolationSql(options.isolationLevel) : undefined;
     return this.exclusive(async () => {
-      const outcome = await runTransaction(this.connection, work, isolation);
+      const outcome = await runTransaction(this.connection, work, isolation, this.native);
       if ('error' in outcome) {
         throw outcome.error;
       }
@@ -142,7 +153,12 @@ type Outcome<T> = { result: T; broken?: boolean } | { error: unknown; broken?: b
  * `SET TRANSACTION ISOLATION LEVEL` sets the level of the next transaction only, so the connection's own level, which
  * the application may have set, is left as it was.
  */
-async function runTransaction<T>(connection: Mysql2ConnectionLike, work: (transaction: SqlTransaction) => Promise<T>, isolation?: string): Promise<Outcome<T>> {
+async function runTransaction<T>(
+  connection: Mysql2ConnectionLike,
+  work: (transaction: SqlTransaction) => Promise<T>,
+  isolation: string | undefined,
+  native: unknown,
+): Promise<Outcome<T>> {
   try {
     if (isolation) {
       await connection.query(`SET TRANSACTION ISOLATION LEVEL ${isolation}`);
@@ -154,7 +170,7 @@ async function runTransaction<T>(connection: Mysql2ConnectionLike, work: (transa
 
   let result: T;
   try {
-    result = await work(connectionTransaction(connection));
+    result = await work(connectionTransaction(connection, native));
   } catch (error) {
     try {
       await connection.query('ROLLBACK');
@@ -198,6 +214,7 @@ function mysql2Transaction(transaction: unknown): SqlTransaction {
       await inTransaction();
       return written(connection, text, params);
     },
+    native: transaction,
   };
 }
 
@@ -212,10 +229,12 @@ async function assertInTransaction(connection: Mysql2ConnectionLike): Promise<vo
   }
 }
 
-function connectionTransaction(connection: Mysql2ConnectionLike): SqlTransaction {
+/** Statements on `connection` (the promise API's), in the transaction `runTransaction()` began on it. */
+function connectionTransaction(connection: Mysql2ConnectionLike, native: unknown): SqlTransaction {
   return {
     query: <R extends object>(text: string, params: readonly unknown[] = []) => rows<R>(connection, text, params),
     execute: (text: string, params: readonly unknown[] = []) => written(connection, text, params),
+    native,
   };
 }
 

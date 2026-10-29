@@ -5,12 +5,13 @@
  * (`skit_`) and sweeps them. Every pool has at most 4 connections: the server may be shared.
  */
 import { PrismaMariaDb } from '@prisma/adapter-mariadb';
+import { is } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/mysql2';
-import { mysqlTable, varchar } from 'drizzle-orm/mysql-core';
-import { Kysely, MysqlDialect } from 'kysely';
+import { MySqlTransaction, mysqlTable, varchar } from 'drizzle-orm/mysql-core';
+import { Kysely, MysqlDialect, Transaction } from 'kysely';
 import mysqlCallbacks from 'mysql2';
 import mysql from 'mysql2/promise';
-import { Column, DataSource, Entity, PrimaryColumn } from 'typeorm';
+import { Column, DataSource, Entity, EntityManager, PrimaryColumn } from 'typeorm';
 import { fromDrizzle, fromKysely, fromMysql2, fromPrisma, fromTypeOrm, type SqlExecutor } from '../../lib/mysql/index.js';
 import { PrismaClient } from '../fixtures/prisma-mysql/generated/client.js';
 import { startMysql } from '../support/mysql.js';
@@ -33,6 +34,8 @@ export interface Client {
   root: unknown;
   /** The application's write, through its transaction object. */
   insertOrder(tx: unknown, id: string): Promise<void>;
+  /** Whether `value` is the client's own transaction object, the kind its transactions hand the application's work. */
+  isNative(value: unknown): boolean;
   close(): Promise<void>;
 }
 
@@ -84,6 +87,7 @@ export const mysql2Client: ClientFactory = {
       insertOrder: async (tx, id) => {
         await (tx as mysql.PoolConnection).query("INSERT INTO orders (id, status) VALUES (?, 'placed')", [id]);
       },
+      isNative: (value) => value instanceof mysql.PoolConnection,
       close: () => pool.end(),
     };
   },
@@ -102,6 +106,7 @@ export const drizzleClient: ClientFactory = {
       insertOrder: async (tx, id) => {
         await (tx as typeof db).insert(drizzleOrders).values({ id, status: 'placed' });
       },
+      isNative: (value) => is(value, MySqlTransaction),
       close: () => pool.end(),
     };
   },
@@ -119,6 +124,7 @@ export const typeOrmClient: ClientFactory = {
       insertOrder: async (tx, id) => {
         await (tx as DataSource['manager']).insert(OrderEntity, { id, status: 'placed' });
       },
+      isNative: (value) => value instanceof EntityManager && value.queryRunner?.isTransactionActive === true,
       close: () => dataSource.destroy(),
     };
   },
@@ -142,6 +148,8 @@ export const prismaClient: ClientFactory = {
       insertOrder: async (tx, id) => {
         await (tx as PrismaClient).order.create({ data: { id, status: 'placed' } });
       },
+      // A transaction client: the client's models, without $connect().
+      isNative: (value) => typeof (value as PrismaClient | null)?.order?.create === 'function' && typeof (value as { $connect?: unknown }).$connect !== 'function',
       close: () => prisma.$disconnect(),
     };
   },
@@ -159,6 +167,7 @@ export const kyselyClient: ClientFactory = {
       insertOrder: async (tx, id) => {
         await (tx as typeof db).insertInto('orders').values({ id, status: 'placed' }).execute();
       },
+      isNative: (value) => value instanceof Transaction,
       close: () => db.destroy(),
     };
   },
@@ -190,6 +199,7 @@ export const singleConnectionClient: ClientFactory = {
       insertOrder: async (tx, id) => {
         await (tx as mysql.Connection).query("INSERT INTO orders (id, status) VALUES (?, 'placed')", [id]);
       },
+      isNative: (value) => value === connection,
       close: () => connection.end(),
     };
   },

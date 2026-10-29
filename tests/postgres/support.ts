@@ -6,12 +6,13 @@
  */
 import { PGlite } from '@electric-sql/pglite';
 import { PrismaPg } from '@prisma/adapter-pg';
+import { is } from 'drizzle-orm';
 import { drizzle as drizzlePg } from 'drizzle-orm/node-postgres';
-import { pgTable, text } from 'drizzle-orm/pg-core';
+import { PgTransaction, pgTable, text } from 'drizzle-orm/pg-core';
 import { drizzle as drizzlePglite } from 'drizzle-orm/pglite';
-import { Kysely, PostgresDialect } from 'kysely';
+import { Kysely, PostgresDialect, Transaction } from 'kysely';
 import pg from 'pg';
-import { Column, DataSource, Entity, PrimaryColumn } from 'typeorm';
+import { Column, DataSource, Entity, EntityManager, PrimaryColumn } from 'typeorm';
 import type { SqlExecutor as AnySqlExecutor, SqlDialect } from '../../lib/index.js';
 import { fromDrizzle, fromKysely, fromPg, fromPrisma, fromTypeOrm, type SqlExecutor } from '../../lib/postgres/index.js';
 import { PrismaClient } from '../fixtures/prisma/generated/client.js';
@@ -32,6 +33,8 @@ export interface Client {
   root: unknown;
   /** The application's write, through its transaction object. */
   insertOrder(tx: unknown, id: string): Promise<void>;
+  /** Whether `value` is the client's own transaction object, the kind its transactions hand the application's work. */
+  isNative(value: unknown): boolean;
   close(): Promise<void>;
 }
 
@@ -80,6 +83,7 @@ export const pgClient: ClientFactory = {
       insertOrder: async (tx, id) => {
         await (tx as pg.PoolClient).query("INSERT INTO orders (id, status) VALUES ($1, 'placed')", [id]);
       },
+      isNative: (value) => value instanceof pg.Client && typeof (value as pg.PoolClient).release === 'function',
       close: () => endPool(pool),
     };
   },
@@ -98,6 +102,7 @@ export const drizzleClient: ClientFactory = {
       insertOrder: async (tx, id) => {
         await (tx as typeof db).insert(drizzleOrders).values({ id, status: 'placed' });
       },
+      isNative: (value) => is(value, PgTransaction),
       close: () => endPool(pool),
     };
   },
@@ -115,6 +120,7 @@ export const typeOrmClient: ClientFactory = {
       insertOrder: async (tx, id) => {
         await (tx as DataSource['manager']).insert(OrderEntity, { id, status: 'placed' });
       },
+      isNative: (value) => value instanceof EntityManager && value.queryRunner?.isTransactionActive === true,
       close: () => dataSource.destroy(),
     };
   },
@@ -138,6 +144,8 @@ export const prismaClient: ClientFactory = {
       insertOrder: async (tx, id) => {
         await (tx as PrismaClient).order.create({ data: { id, status: 'placed' } });
       },
+      // A transaction client: the client's models, without $connect().
+      isNative: (value) => typeof (value as PrismaClient | null)?.order?.create === 'function' && typeof (value as { $connect?: unknown }).$connect !== 'function',
       close: () => prisma.$disconnect(),
     };
   },
@@ -155,6 +163,7 @@ export const kyselyClient: ClientFactory = {
       insertOrder: async (tx, id) => {
         await (tx as typeof db).insertInto('orders').values({ id, status: 'placed' }).execute();
       },
+      isNative: (value) => value instanceof Transaction,
       close: () => db.destroy(),
     };
   },
@@ -177,6 +186,7 @@ export async function openPglite(): Promise<Client & { pglite: PGlite }> {
     insertOrder: async (tx, id) => {
       await (tx as typeof db).insert(drizzleOrders).values({ id, status: 'placed' });
     },
+    isNative: (value) => is(value, PgTransaction),
     close: () => pglite.close(),
   };
 }

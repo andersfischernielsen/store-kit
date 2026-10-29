@@ -42,6 +42,8 @@ $ npm i --save @nestjs/store-kit
 - `@nestjs/store-kit/mysql`: the same for MySQL 8.4 LTS and 9.x: the executors (`fromMysql2`, `fromDrizzle`, `fromTypeOrm`, `fromPrisma`, `fromKysely`, and `isNotATransactionError()`), `StoreSchema` (a store's tables in the connection's database as `<schema>_<table>`, migrations applied statement by statement under `GET_LOCK()` and resumed where a failed run stopped), and the statement helpers (`SqlParams`, `columns`, `toText`/`toInt`/`toBool`/`toJson`, `quoteIdentifier`, `quoteTable`, `keyColumn`, `lockKeys`, `ensureLockRows`, `lockRowId`, `retryOnDeadlock`, `mysqlErrorCode`).
 - `@nestjs/store-kit/testing`: `sqlExecutorContract()`, for an executor of another client.
 
+A `SqlTransaction` carries the client's own transaction object as its `native` (the node-postgres client or mysql2 connection in its transaction, Drizzle's `tx`, TypeORM's `EntityManager`, Prisma's transaction client, Kysely's `Transaction`): the object `wrapTransaction()` takes, and gives back (`wrapTransaction(x).native === x`). So a store that opens a transaction (`executor.transaction()`) can hand it to the application's code, whose writes through the client's own API land in that transaction. Every executor of the kit sets it; it's optional in `SqlTransaction`, and `sqlExecutorContract()` checks it where an executor sets it. On PostgreSQL, which ends a transaction at its first failed statement, work that caught the error of a statement it sent through `native` is rejected, nothing committed, as it is for one sent through `query()`: `fromPg()` reads its COMMIT's reply, at no cost, and the other executors send one statement at the end of work that read `native`.
+
 ## A store in brief
 
 ```ts

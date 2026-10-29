@@ -95,7 +95,7 @@ class TypeOrmExecutor implements SqlExecutor {
   }
 
   async transaction<T>(work: (transaction: SqlTransaction) => Promise<T>, options: SqlTransactionOptions = {}): Promise<T> {
-    const inTransaction = (manager: TypeOrmMySqlEntityManagerLike) => work(runnerTransaction(manager.queryRunner!));
+    const inTransaction = (manager: TypeOrmMySqlEntityManagerLike) => work(runnerTransaction(manager.queryRunner!, manager));
     // TypeORM sends SET TRANSACTION ISOLATION LEVEL (the next transaction's alone) before START TRANSACTION.
     return options.isolationLevel ? this.dataSource.transaction(isolationSql(options.isolationLevel), inTransaction) : this.dataSource.transaction(inTransaction);
   }
@@ -114,11 +114,12 @@ class TypeOrmExecutor implements SqlExecutor {
     if (type !== undefined && type !== 'mysql') {
       throw notATransaction(`Pass the EntityManager of a DataSource of type 'mysql', not '${String(type)}': the store's statements run on MySQL.`);
     }
-    return runnerTransaction(runner);
+    return runnerTransaction(runner, transaction);
   }
 }
 
-function runnerTransaction(runner: TypeOrmMySqlQueryRunnerLike): SqlTransaction {
+/** Statements on `runner`; `native` is what the application holds: the `EntityManager`, or the `QueryRunner` given. */
+function runnerTransaction(runner: TypeOrmMySqlQueryRunnerLike, native: unknown): SqlTransaction {
   return {
     query: <R extends object>(text: string, params: readonly unknown[] = []) => {
       checkPlaceholders(text, params);
@@ -128,6 +129,7 @@ function runnerTransaction(runner: TypeOrmMySqlQueryRunnerLike): SqlTransaction 
       checkPlaceholders(text, params);
       return write(runner, text, params);
     },
+    native,
   };
 }
 

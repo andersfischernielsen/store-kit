@@ -8,7 +8,7 @@
 import { PrismaMariaDb } from '@prisma/adapter-mariadb';
 import { drizzle as drizzleMysql } from 'drizzle-orm/mysql2';
 import { drizzle as drizzlePg } from 'drizzle-orm/node-postgres';
-import { CamelCasePlugin, Kysely, MysqlDialect, PostgresDialect, SqliteDialect } from 'kysely';
+import { CamelCasePlugin, Kysely, MysqlDialect, PostgresDialect, SqliteDialect, sql } from 'kysely';
 import mysqlCallbacks from 'mysql2';
 import mysql from 'mysql2/promise';
 import pg from 'pg';
@@ -61,6 +61,14 @@ describe.each(targets)('$name', ({ open }) => {
       .catch((error: unknown) => error);
     expect(mistake).toBeInstanceOf(TypeError);
     expect(isNotATransactionError(mistake)).toBe(false);
+  });
+
+  it("hands its transactions' work the client's own transaction object as native, and gives the application's back as it was given", async () => {
+    expect(await client.executor.transaction(async (tx) => client.isNative(tx.native))).toBe(true);
+    await client.transaction(async (tx) => {
+      expect(client.isNative(tx)).toBe(true);
+      expect(client.executor.wrapTransaction(tx).native).toBe(tx);
+    });
   });
 
   it('refuses a statement whose ? placeholders and params differ, before it runs', async () => {
@@ -136,7 +144,27 @@ describe('the clients each executor takes', () => {
       await connection.beginTransaction();
       expect(await executor.wrapTransaction(connection).query('SELECT ? AS one', ['1'])).toEqual([{ one: '1' }]);
       expect(await executor.wrapTransaction(connection.connection).query('SELECT ? AS one', ['1'])).toEqual([{ one: '1' }]);
+      // The native is the connection as it was given, of either API.
+      expect(executor.wrapTransaction(connection).native).toBe(connection);
+      expect(executor.wrapTransaction(connection.connection).native).toBe(connection.connection);
       await connection.rollback();
+
+      // A callback-API pool's transaction hands out a callback-API connection (the application's kind): its own.
+      const native = await fromMysql2(callbacks as never).transaction(async (tx) => {
+        const own = tx.native as mysqlCallbacks.PoolConnection;
+        const [row] = await new Promise<Array<{ id: unknown }>>((resolve, reject) =>
+          own.query('SELECT CONNECTION_ID() AS id', (error: unknown, rows: never) => (error ? reject(error) : resolve(rows))),
+        );
+        expect(await tx.query('SELECT CONNECTION_ID() AS id')).toEqual([{ id: row!.id }]);
+        return own;
+      });
+      expect(native).toBeInstanceOf(mysqlCallbacks.PoolConnection);
+      const single = mysqlCallbacks.createConnection({ uri: database!.url });
+      try {
+        expect(await fromMysql2(single as never).transaction(async (tx) => tx.native === single)).toBe(true);
+      } finally {
+        await new Promise((resolve) => single.end(resolve));
+      }
 
       const pgPool = new pg.Pool({ connectionString: 'postgres://nobody@127.0.0.1:1/none' });
       expect(() => fromMysql2(pgPool as never)).toThrow(
@@ -216,6 +244,9 @@ describe('the clients each executor takes', () => {
       const runner = (manager.connection as { createQueryRunner(): any }).createQueryRunner();
       await runner.startTransaction();
       expect(await typeorm.executor.wrapTransaction(runner).query('SELECT ? AS one', ['1'])).toEqual([{ one: '1' }]);
+      // The native is what was given: the runner, or its manager.
+      expect(typeorm.executor.wrapTransaction(runner).native).toBe(runner);
+      expect(typeorm.executor.wrapTransaction(runner.manager).native).toBe(runner.manager);
       await runner.rollbackTransaction();
       expect(() => typeorm.executor.wrapTransaction(runner)).toThrow('Pass the EntityManager your dataSource.transaction() callback receives');
       await runner.release();
@@ -244,12 +275,18 @@ describe('the clients each executor takes', () => {
     }
   });
 
-  it("fromKysely() takes the Kysely instance, not a transaction, and runs the store's statements without its plugins", async () => {
+  it("fromKysely() takes the Kysely instance, not a transaction, and runs the store's statements without its plugins, not its transactions' native", async () => {
     const db = new Kysely<object>({ dialect: new MysqlDialect({ pool: mysqlCallbacks.createPool({ uri: database!.url, connectionLimit: 2 }) }), plugins: [new CamelCasePlugin()] });
     try {
       const executor = fromKysely(db);
       expect(await executor.query('SELECT ? AS lease_until', ['1'])).toEqual([{ lease_until: '1' }]);
       expect(await executor.transaction((tx) => tx.query('SELECT ? AS lease_until', ['1']))).toEqual([{ lease_until: '1' }]);
+      // The native is the application's trx, plugins and all, on the connection of the store's statements.
+      const [native, store] = await executor.transaction(async (tx) => [
+        (await sql<object>`SELECT ${'1'} AS lease_until, CONNECTION_ID() AS connection_id`.execute(tx.native as Kysely<object>)).rows,
+        await tx.query('SELECT CONNECTION_ID() AS connection_id'),
+      ]);
+      expect(native).toEqual([{ leaseUntil: '1', connectionId: (store[0] as { connection_id: unknown }).connection_id }]);
       await db.transaction().execute(async (trx) => {
         expect(await executor.wrapTransaction(trx).query('SELECT ? AS lease_until', ['1'])).toEqual([{ lease_until: '1' }]);
         expect(() => fromKysely(trx as never)).toThrow('fromKysely() takes the Kysely instance, not a transaction');
