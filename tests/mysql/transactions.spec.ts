@@ -117,4 +117,22 @@ describe.each(targets)('$name', ({ schema, open }) => {
       }
     }, 'repeatable read');
   });
+
+  it("adds a note another connection committed after the application's REPEATABLE READ snapshot as a no-op (1020 under MariaDB's snapshot isolation)", async () => {
+    const id = `${schema}-raced`;
+    await client.transaction(async (tx) => {
+      const joined = client.executor.wrapTransaction(tx);
+      await joined.query(`SELECT COUNT(*) AS n FROM ${schema}_notes`);
+      await outside(`INSERT INTO ${schema}_notes (id, body, created_at) VALUES (?, 'raced', 1)`, [id]);
+
+      const added = store.addInTransaction(tx, { id, body: 'mine', createdAt: 2 });
+      if (snapshotIsolation) {
+        expect(mysqlErrorCode(await added.catch((e: unknown) => e))).toBe(1020);
+      } else {
+        expect(await added).toBe(false);
+      }
+    }, 'repeatable read');
+
+    expect(await store.get(id)).toEqual({ id, body: 'raced', tags: [], archived: false, createdAt: 1 });
+  });
 });

@@ -96,9 +96,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The LTS lines the MySQL stores support on MariaDB (utf8mb4_0900_bin is 11.4's). 11.8 also has
-        # innodb_snapshot_isolation on by default, which 11.4 doesn't.
-        mariadb: ['11.4', '11.8']
+        # The oldest patches of the LTS lines where utf8mb4_0900_bin is NO PAD (11.4.7, 11.8.2), and the current 11.8.
+        # 11.8 also has innodb_snapshot_isolation on by default, which 11.4 doesn't.
+        mariadb: ['11.4.7', '11.8.2', '11.8']
     env:
       SQL_TEST_MYSQL_URL: mysql://root:root@127.0.0.1:3306
     steps:
